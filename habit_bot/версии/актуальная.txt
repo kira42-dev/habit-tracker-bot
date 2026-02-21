@@ -1,0 +1,440 @@
+# ==============================
+# HABIT TRACKER TELEGRAM BOT
+# python-telegram-bot v20+
+# ==============================
+
+import os
+import sqlite3
+from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup
+)
+
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters
+)
+
+# ==============================
+# ENV
+# ==============================
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not found!")
+
+# ==============================
+# DATABASE
+# ==============================
+
+DB = "habits.db"
+
+
+def db():
+    return sqlite3.connect(DB)
+
+
+def init_db():
+    conn = db()
+    c = conn.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY,
+        telegram_id INTEGER UNIQUE
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS activities(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        description TEXT,
+        period INTEGER
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        activity_id INTEGER,
+        log_date TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# ==============================
+# HELPERS
+# ==============================
+
+def get_user_id(tg_id):
+    conn = db()
+    c = conn.cursor()
+
+    c.execute("INSERT OR IGNORE INTO users(telegram_id) VALUES(?)", (tg_id,))
+    conn.commit()
+
+    c.execute("SELECT id FROM users WHERE telegram_id=?", (tg_id,))
+    uid = c.fetchone()[0]
+
+    conn.close()
+    return uid
+
+
+def get_activities(user_id):
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM activities WHERE user_id=?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def add_log(activity_id):
+    conn = db()
+    c = conn.cursor()
+    today = date.today().isoformat()
+
+    c.execute(
+        "INSERT INTO logs(activity_id, log_date) VALUES(?,?)",
+        (activity_id, today)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_logs(activity_id):
+    conn = db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT log_date FROM logs WHERE activity_id=? ORDER BY log_date DESC",
+        (activity_id,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [date.fromisoformat(x[0]) for x in rows]
+
+
+# ==============================
+# STREAK LOGIC
+# ==============================
+
+def calculate_streak(activity_id, period):
+    """
+    Алгоритм:
+
+    1. Берём даты выполнения (новые → старые)
+    2. Считаем разницу между соседними отметками
+    3. Если разница <= period → серия продолжается
+    4. Если больше → серия обрывается
+    """
+
+    logs = get_logs(activity_id)
+    if not logs:
+        return 0, 0, None, "нет данных"
+
+    current = 1
+    max_streak = 1
+
+    for i in range(len(logs) - 1):
+        diff = (logs[i] - logs[i + 1]).days
+        if diff <= period:
+            current += 1
+        else:
+            break
+
+    temp = 1
+    for i in range(len(logs) - 1):
+        diff = (logs[i] - logs[i + 1]).days
+        if diff <= period:
+            temp += 1
+            max_streak = max(max_streak, temp)
+        else:
+            temp = 1
+
+    last = logs[0]
+    days_since = (date.today() - last).days
+
+    if days_since <= period:
+        status = "✅ в норме"
+    else:
+        status = "❌ просрочено"
+
+    return current, max_streak, last, status
+
+
+# ======================
+# CREATE ACTIVITY
+# ======================
+
+NAME, DESC, PERIOD, REMINDER_TIME = range(4)
+
+
+async def interrupt_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Позволяет нажимать кнопки во время создания активности"""
+    context.user_data.clear()
+    return await text_router(update, context)
+
+
+async def new_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📝 Введите название активности:")
+    return NAME
+
+
+async def new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if len(text) < 2:
+        await update.message.reply_text("⚠️ Название слишком короткое.")
+        return NAME
+
+    context.user_data["name"] = text
+    await update.message.reply_text("📋 Введите описание (или '-'):")
+    return DESC
+
+
+async def new_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["desc"] = update.message.text
+    await update.message.reply_text("⏱ Введите периодичность в днях:")
+    return PERIOD
+
+
+def parse_time_str(time_str: str):
+    try:
+        h, m = map(int, time_str.split(":"))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return f"{h:02d}:{m:02d}"
+    except:
+        pass
+    return None
+
+
+async def new_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        period = int(update.message.text)
+        if period <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Введите число больше 0.")
+        return PERIOD
+
+    context.user_data["period"] = period
+
+    await update.message.reply_text(
+        "⏰ Введите время напоминания ЧЧ:ММ или 0:"
+    )
+    return REMINDER_TIME
+
+
+async def new_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    reminder_time = None
+
+    if text not in ["0", "-", "нет"]:
+        parsed = parse_time_str(text)
+        if not parsed:
+            await update.message.reply_text(
+                "⚠️ Формат времени ЧЧ:ММ (например 09:00)"
+            )
+            return REMINDER_TIME
+        reminder_time = parsed
+
+    user_id = get_user_id(update.effective_user.id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO activities
+            (user_id, name, description, period_days, created_at, reminder_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            context.user_data["name"],
+            context.user_data["desc"],
+            context.user_data["period"],
+            datetime.now().isoformat(),
+            reminder_time,
+        ))
+        conn.commit()
+
+    await update.message.reply_text(
+        "✅ Активность создана!",
+        reply_markup=main_keyboard(),
+    )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+
+# ==============================
+# KEYBOARDS
+# ==============================
+
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["✅ Отметить сегодня", "📋 Мои активности"],
+            ["➕ Добавить активность", "🗑 Удалить"],
+            ["🔄 Перезапуск", "❌ Отмена"]
+        ],
+        resize_keyboard=True
+    )
+
+
+# ==============================
+# START
+# ==============================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Habit Tracker запущен",
+        reply_markup=main_keyboard()
+    )
+
+
+# ==============================
+# LIST ACTIVITIES
+# ==============================
+
+async def list_activities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = get_user_id(update.effective_user.id)
+    activities = get_activities(uid)
+
+    if not activities:
+        await update.message.reply_text("Нет активностей")
+        return
+
+    text = "📋 Мои активности\n\n"
+
+    for a in activities:
+        cur, mx, last, status = calculate_streak(a[0], a[4])
+        text += (
+            f"🏃 {a[2]}\n"
+            f"Период: {a[4]} дн.\n"
+            f"Серия: {cur} (макс {mx})\n"
+            f"Статус: {status}\n\n"
+        )
+
+    await update.message.reply_text(text)
+
+
+# ==============================
+# MARK TODAY
+# ==============================
+
+async def mark_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = get_user_id(update.effective_user.id)
+    activities = get_activities(uid)
+
+    if not activities:
+        await update.message.reply_text("Нет активностей")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(a[2], callback_data=f"log_{a[0]}")]
+        for a in activities
+    ]
+
+    await update.message.reply_text(
+        "Выбери активность:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    activity_id = int(query.data.split("_")[1])
+    add_log(activity_id)
+
+    await query.edit_message_text("✅ Отмечено!")
+
+
+# ==============================
+# DELETE
+# ==============================
+
+async def delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = get_user_id(update.effective_user.id)
+    activities = get_activities(uid)
+
+    keyboard = [
+        [InlineKeyboardButton(a[2], callback_data=f"del_{a[0]}")]
+        for a in activities
+    ]
+
+    await update.message.reply_text(
+        "Удалить:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    aid = int(query.data.split("_")[1])
+
+    conn = db()
+    c = conn.cursor()
+    c.execute("DELETE FROM activities WHERE id=?", (aid,))
+    conn.commit()
+    conn.close()
+
+    await query.edit_message_text("🗑 Удалено")
+
+
+# ==============================
+# MAIN
+# ==============================
+
+def main():
+    init_db()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+
+    app.add_handler(MessageHandler(
+        filters.Regex("^📋 Мои активности$"),
+        list_activities
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex("^✅ Отметить сегодня$"),
+        mark_today
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex("^🗑 Удалить$"),
+        delete_menu
+    ))
+
+    app.add_handler(CallbackQueryHandler(log_callback, pattern="^log_"))
+    app.add_handler(CallbackQueryHandler(delete_callback, pattern="^del_"))
+
+    print("Bot started...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()

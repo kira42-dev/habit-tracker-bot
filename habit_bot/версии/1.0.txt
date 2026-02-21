@@ -1,0 +1,681 @@
+import os
+import sqlite3
+import calendar
+from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+# ======================
+# ENV
+# ======================
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN not found")
+
+# ======================
+# DB
+# ======================
+
+DB_NAME = "habits.db"
+
+
+def get_db():
+    return sqlite3.connect(DB_NAME)
+
+
+def init_db():
+    with get_db() as conn:
+        c = conn.cursor()
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS activities (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            name TEXT,
+            description TEXT,
+            period_days INTEGER,
+            created_at TEXT
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            activity_id INTEGER,
+            log_date TEXT
+        )
+        """)
+
+        conn.commit()
+
+
+def get_user_id(telegram_id: int) -> int:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
+        row = c.fetchone()
+
+        if row:
+            return row[0]
+
+        c.execute("INSERT INTO users (telegram_id) VALUES (?)", (telegram_id,))
+        conn.commit()
+        return c.lastrowid
+
+
+def get_next_available_id():
+    """Получает минимальный доступный ID для новой активности"""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM activities ORDER BY id")
+        existing_ids = [row[0] for row in c.fetchall()]
+
+        if not existing_ids:
+            return 1
+
+        # Находим минимальный пропущенный ID
+        for i in range(1, max(existing_ids) + 2):
+            if i not in existing_ids:
+                return i
+
+
+# ======================
+# KEYBOARD
+# ======================
+
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["➕ Новая активность", "✅ Отметить сегодня"],
+            ["📋 Мои активности"],
+            ["🗑 Удалить", "🔄 Перезапуск"],
+            ["❌ Отмена"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+# ======================
+# STREAK LOGIC
+# ======================
+
+def calculate_streak(activity_id: int, period_days: int):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT log_date FROM logs WHERE activity_id = ? ORDER BY log_date DESC",
+            (activity_id,),
+        )
+        rows = c.fetchall()
+
+    if not rows:
+        return 0, 0, None, True, None
+
+    dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
+    today = date.today()
+    last_log = dates[0]
+
+    days_since = (today - last_log).days
+    overdue = days_since > period_days
+    days_left = max(0, period_days - days_since)
+
+    # current streak
+    current = 0
+    prev = None
+
+    for d in dates:
+        if prev is None:
+            if (today - d).days <= period_days:
+                current = 1
+            else:
+                break
+        else:
+            if (prev - d).days <= period_days:
+                current += 1
+            else:
+                break
+        prev = d
+
+    # max streak
+    max_streak = 1
+    temp = 1
+
+    for i in range(1, len(dates)):
+        if (dates[i - 1] - dates[i]).days <= period_days:
+            temp += 1
+            max_streak = max(max_streak, temp)
+        else:
+            temp = 1
+
+    return current, max_streak, last_log, overdue, days_left
+
+
+def build_calendar(activity_id: int):
+    today = date.today()
+    year, month = today.year, today.month
+    _, last_day = calendar.monthrange(year, month)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT log_date FROM logs WHERE activity_id = ?", (activity_id,))
+        logged_dates = {}
+        for r in c.fetchall():
+            d = datetime.strptime(r[0], "%Y-%m-%d").date()
+            if d.year == year and d.month == month:
+                logged_dates[d.day] = True
+
+    lines = [f"📅 {calendar.month_name[month]} {year}"]
+    for day in range(1, last_day + 1):
+        if day in logged_dates:
+            mark = "🟢"  # Отмечено
+        else:
+            mark = "⚪️"  # Не отмечено
+        lines.append(f"{day:02d} {mark}")
+
+    return "\n".join(lines)
+
+
+def format_activity_info(act_id, name, description, period):
+    cur, maxs, last, overdue, left = calculate_streak(act_id, period)
+
+    # Определяем статус и эмодзи
+    if last is None:
+        status = "🆕 Никогда не выполнялась"
+        status_emoji = "🆕"
+    elif overdue:
+        status = f"🔴 Просрочено на {abs(left)} дн."
+        status_emoji = "🔴"
+    else:
+        if left == 0:
+            status = "🟡 Выполнить сегодня!"
+            status_emoji = "🟡"
+        else:
+            status = f"🟢 {left} дн. до следующего раза"
+            status_emoji = "🟢"
+
+    # Форматируем дату последней отметки
+    if last:
+        last_str = last.strftime("%d.%m.%Y")
+    else:
+        last_str = "—"
+
+    # Определяем следующий день для выполнения
+    if last:
+        next_day = last + timedelta(days=period)
+        next_str = next_day.strftime("%d.%m.%Y")
+    else:
+        next_str = "Любой день"
+
+    # Форматируем описание
+    desc = description if description and description != '-' else "—"
+
+    # Создаем красивый вывод
+    lines = [
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"┃ 🆔 ID: {act_id}",
+        f"┃ 🏷 Название: {name}",
+        f"┃ 📝 Описание: {desc}",
+        f"┃ ⏱ Периодичность: каждые {period} дн.",
+        f"┃ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"┃ 📊 Статистика:",
+        f"┃   🔥 Текущая серия: {cur}",
+        f"┃   🏆 Лучшая серия: {maxs}",
+        f"┃ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"┃ 📅 Последняя отметка: {last_str}",
+        f"┃ ⏰ Следующий раз: {next_str}",
+        f"┃ 🎯 Статус: {status}",
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    return "\n".join(lines)
+
+
+# ======================
+# COMMANDS
+# ======================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "👋 Привет! Я трекер привычек.\nВыбери действие 👇",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🔄 Бот перезапущен.",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "❌ Действие отменено.",
+        reply_markup=main_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ======================
+# CREATE ACTIVITY
+# ======================
+
+NAME, DESC, PERIOD = range(3)
+
+
+async def new_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📝 Введите название активности:")
+    return NAME
+
+
+async def new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text
+    await update.message.reply_text("📋 Введите описание (или '-' если не нужно):")
+    return DESC
+
+
+async def new_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["desc"] = update.message.text
+    await update.message.reply_text("⏱ Введите периодичность в днях (например, 3 - раз в 3 дня):")
+    return PERIOD
+
+
+async def new_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        period = int(update.message.text)
+        if period <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Введите целое число больше 0.")
+        return PERIOD
+
+    user_id = get_user_id(update.effective_user.id)
+
+    # Получаем следующий доступный ID
+    new_id = get_next_available_id()
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO activities (id, user_id, name, description, period_days, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            new_id,
+            user_id,
+            context.user_data["name"],
+            context.user_data["desc"],
+            period,
+            datetime.now().isoformat(),
+        ))
+        conn.commit()
+
+    await update.message.reply_text(
+        f"✅ Активность создана!\n\n"
+        f"🏷 Название: {context.user_data['name']}\n"
+        f"⏱ Периодичность: каждые {period} дней\n"
+        f"🆔 ID активности: {new_id}\n\n"
+        f"Используйте этот ID для отметки выполнения.",
+        reply_markup=main_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ======================
+# BUTTON ACTIONS
+# ======================
+
+async def log_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = get_user_id(update.effective_user.id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT a.id, a.name, a.period_days, 
+                   (SELECT MAX(log_date) FROM logs WHERE activity_id = a.id) as last_log
+            FROM activities a 
+            WHERE a.user_id = ?
+            ORDER BY a.id
+        """, (user_id,))
+        acts = c.fetchall()
+
+    if not acts:
+        await update.message.reply_text("📭 У вас пока нет активностей.")
+        return
+
+    today = date.today()
+    text = "📋 Ваши активности:\n\n"
+
+    for act_id, name, period, last_log_str in acts:
+        # Проверяем, можно ли отмечать сегодня
+        can_log_today = True
+        days_passed = 0
+        if last_log_str:
+            last_log = datetime.strptime(last_log_str, "%Y-%m-%d").date()
+            days_passed = (today - last_log).days
+            can_log_today = days_passed >= period
+        else:
+            can_log_today = True
+
+        status = "✅ Можно отметить" if can_log_today else f"⏳ Ждите {period - days_passed} дн."
+
+        text += f"🆔 {act_id} — {name}\n"
+        text += f"   ⏱ Каждые {period} дней | {status}\n"
+        if last_log_str:
+            last_log_date = datetime.strptime(last_log_str, "%Y-%m-%d").date()
+            next_date = last_log_date + timedelta(days=period)
+            text += f"   📅 Следующий раз: {next_date.strftime('%d.%m.%Y')}\n"
+        text += "\n"
+
+    text += "\n✏️ Введите ID активности для отметки:"
+
+    context.user_data["mode"] = "log"
+    await update.message.reply_text(text)
+
+
+async def list_activities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = get_user_id(update.effective_user.id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, name, description, period_days 
+            FROM activities 
+            WHERE user_id = ? 
+            ORDER BY id
+        """, (user_id,))
+        acts = c.fetchall()
+
+    if not acts:
+        await update.message.reply_text("📭 У вас пока нет активностей.")
+        return
+
+    # Сохраняем список активностей для выбора
+    context.user_data["list_mode"] = True
+    context.user_data["activities_list"] = [act[0] for act in acts]  # Сохраняем ID активностей
+
+    text = "📋 Выберите активность для просмотра:\n\n"
+
+    for idx, (act_id, name, description, period) in enumerate(acts, 1):
+        # Получаем информацию о статусе
+        cur, maxs, last, overdue, left = calculate_streak(act_id, period)
+
+        # Определяем статус
+        if last is None:
+            status = "🆕"
+        elif overdue:
+            status = "🔴"
+        elif left == 0:
+            status = "🟡"
+        else:
+            status = "🟢"
+
+        text += f"{status} ID {act_id}: {name}\n"
+        if last:
+            last_str = last.strftime("%d.%m")
+            text += f"   📅 Последний раз: {last_str} | ⏱ Каждые {period} дн.\n"
+        else:
+            text += f"   📅 Еще не выполнялось | ⏱ Каждые {period} дн.\n"
+        text += "\n"
+
+    text += "✏️ Введите ID активности для подробной информации:"
+
+    await update.message.reply_text(text)
+
+
+async def delete_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = get_user_id(update.effective_user.id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM activities WHERE user_id = ? ORDER BY id", (user_id,))
+        acts = c.fetchall()
+
+    if not acts:
+        await update.message.reply_text("📭 Нет активностей для удаления.")
+        return
+
+    context.user_data["mode"] = "delete"
+    text = "🗑 Выберите активность для удаления:\n\n"
+
+    for a in acts:
+        text += f"🆔 {a[0]} — {a[1]}\n"
+
+    text += "\n✏️ Введите ID активности для удаления:"
+
+    await update.message.reply_text(text)
+
+
+async def show_activity_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, act_id: int):
+    """Показывает подробную информацию об активности"""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT name, description, period_days 
+            FROM activities 
+            WHERE id = ?
+        """, (act_id,))
+        activity = c.fetchone()
+
+    if not activity:
+        await update.message.reply_text("❌ Активность не найдена.")
+        return
+
+    name, description, period = activity
+    activity_info = format_activity_info(act_id, name, description, period)
+
+    await update.message.reply_text(activity_info)
+
+    # Отправляем календарь отдельным сообщением
+    calendar_text = build_calendar(act_id)
+    await update.message.reply_text(calendar_text)
+
+
+# ======================
+# TEXT ROUTER
+# ======================
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    if text == "➕ Новая активность":
+        return await new_activity(update, context)
+    if text == "✅ Отметить сегодня":
+        return await log_today(update, context)
+    if text == "📋 Мои активности":
+        return await list_activities(update, context)
+    if text == "🗑 Удалить":
+        return await delete_activity(update, context)
+    if text == "🔄 Перезапуск":
+        return await restart(update, context)
+    if text == "❌ Отмена":
+        return await cancel(update, context)
+
+    # Режим просмотра деталей активности
+    if context.user_data.get("list_mode"):
+        try:
+            act_id = int(text)
+        except ValueError:
+            await update.message.reply_text("⚠️ Введите числовой ID.")
+            return
+
+        # Проверяем, что ID есть в списке
+        if act_id not in context.user_data.get("activities_list", []):
+            await update.message.reply_text("❌ Активность с таким ID не найдена.")
+            return
+
+        await show_activity_detail(update, context, act_id)
+        context.user_data.clear()
+        return
+
+    # Режим отметки выполнения
+    if context.user_data.get("mode") == "log":
+        try:
+            act_id = int(text)
+        except ValueError:
+            await update.message.reply_text("⚠️ Введите числовой ID.")
+            return
+
+        today = date.today()
+
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Проверяем существование активности
+            c.execute("SELECT id, period_days FROM activities WHERE id = ?", (act_id,))
+            activity = c.fetchone()
+
+            if not activity:
+                await update.message.reply_text("❌ Активность с таким ID не найдена.")
+                return
+
+            # Получаем последнюю отметку
+            c.execute(
+                "SELECT log_date FROM logs WHERE activity_id = ? ORDER BY log_date DESC LIMIT 1",
+                (act_id,)
+            )
+            last_log_row = c.fetchone()
+
+            # Проверяем периодичность
+            period_days = activity[1]
+            can_log = True
+
+            if last_log_row:
+                last_log = datetime.strptime(last_log_row[0], "%Y-%m-%d").date()
+                days_since = (today - last_log).days
+
+                if days_since < period_days:
+                    days_left = period_days - days_since
+                    next_date = last_log + timedelta(days=period_days)
+                    await update.message.reply_text(
+                        f"⏳ Рано отмечать!\n\n"
+                        f"Последний раз было: {last_log.strftime('%d.%m.%Y')}\n"
+                        f"Периодичность: каждые {period_days} дней\n"
+                        f"Следующий раз: {next_date.strftime('%d.%m.%Y')}\n"
+                        f"Осталось ждать: {days_left} дн."
+                    )
+                    return
+
+            # Проверяем, не отмечено ли уже сегодня
+            c.execute(
+                "SELECT 1 FROM logs WHERE activity_id = ? AND log_date = ?",
+                (act_id, today.isoformat()),
+            )
+            if c.fetchone():
+                await update.message.reply_text("⚠️ Сегодня уже отмечено!")
+                return
+
+            # Отмечаем выполнение
+            c.execute(
+                "INSERT INTO logs (activity_id, log_date) VALUES (?, ?)",
+                (act_id, today.isoformat()),
+            )
+            conn.commit()
+
+            # Получаем название активности для ответа
+            c.execute("SELECT name FROM activities WHERE id = ?", (act_id,))
+            activity_name = c.fetchone()[0]
+
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Отмечено!\n\n"
+            f"🏷 {activity_name}\n"
+            f"📅 {today.strftime('%d.%m.%Y')}\n"
+            f"⏱ Следующий раз через {period_days} дней",
+            reply_markup=main_keyboard(),
+        )
+
+    # Режим удаления
+    elif context.user_data.get("mode") == "delete":
+        try:
+            act_id = int(text)
+        except ValueError:
+            await update.message.reply_text("⚠️ Введите числовой ID.")
+            return
+
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Получаем название активности перед удалением
+            c.execute("SELECT name FROM activities WHERE id = ?", (act_id,))
+            activity = c.fetchone()
+
+            if not activity:
+                await update.message.reply_text("❌ Активность с таким ID не найдена.")
+                return
+
+            activity_name = activity[0]
+
+            # Удаляем логи активности
+            c.execute("DELETE FROM logs WHERE activity_id = ?", (act_id,))
+            # Удаляем саму активность
+            c.execute("DELETE FROM activities WHERE id = ?", (act_id,))
+            conn.commit()
+
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"🗑 Удалено!\n\n"
+            f"🏷 {activity_name}\n"
+            f"🆔 ID: {act_id}\n\n"
+            f"Теперь этот ID доступен для новой активности",
+            reply_markup=main_keyboard(),
+        )
+
+
+# ======================
+# MAIN
+# ======================
+
+def main():
+    init_db()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("restart", restart))
+
+    conv_new = ConversationHandler(
+        entry_points=[
+            CommandHandler("new", new_activity),
+            MessageHandler(filters.Regex("^➕ Новая активность$"), new_activity),
+        ],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_name)],
+            DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_desc)],
+            PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_period)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+        ],
+    )
+
+    app.add_handler(conv_new)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    print("Bot started...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,103 @@
+
+# ======================
+# CREATE ACTIVITY
+# ======================
+
+NAME, DESC, PERIOD, REMINDER_TIME = range(4)
+
+
+async def interrupt_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Позволяет нажимать кнопки во время создания активности"""
+    context.user_data.clear()
+    return await text_router(update, context)
+
+
+async def new_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📝 Введите название активности:")
+    return NAME
+
+
+async def new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if len(text) < 2:
+        await update.message.reply_text("⚠️ Название слишком короткое.")
+        return NAME
+
+    context.user_data["name"] = text
+    await update.message.reply_text("📋 Введите описание (или '-'):")
+    return DESC
+
+
+async def new_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["desc"] = update.message.text
+    await update.message.reply_text("⏱ Введите периодичность в днях:")
+    return PERIOD
+
+
+def parse_time_str(time_str: str):
+    try:
+        h, m = map(int, time_str.split(":"))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return f"{h:02d}:{m:02d}"
+    except:
+        pass
+    return None
+
+
+async def new_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        period = int(update.message.text)
+        if period <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Введите число больше 0.")
+        return PERIOD
+
+    context.user_data["period"] = period
+
+    await update.message.reply_text(
+        "⏰ Введите время напоминания ЧЧ:ММ или 0:"
+    )
+    return REMINDER_TIME
+
+
+async def new_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    reminder_time = None
+
+    if text not in ["0", "-", "нет"]:
+        parsed = parse_time_str(text)
+        if not parsed:
+            await update.message.reply_text(
+                "⚠️ Формат времени ЧЧ:ММ (например 09:00)"
+            )
+            return REMINDER_TIME
+        reminder_time = parsed
+
+    user_id = get_user_id(update.effective_user.id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO activities
+            (user_id, name, description, period_days, created_at, reminder_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            context.user_data["name"],
+            context.user_data["desc"],
+            context.user_data["period"],
+            datetime.now().isoformat(),
+            reminder_time,
+        ))
+        conn.commit()
+
+    await update.message.reply_text(
+        "✅ Активность создана!",
+        reply_markup=main_keyboard(),
+    )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
