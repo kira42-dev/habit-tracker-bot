@@ -1,6 +1,6 @@
-# goida
+# Habit Tracker Bot
 
-Habit tracker Telegram bot. Helps track daily and weekly habits with reminders and streak counting.
+Telegram bot for tracking habits. Helps track daily and weekly habits with reminders and streak counting.
 
 Built on python-telegram-bot v20+, SQLite.
 
